@@ -27,6 +27,13 @@
   th { opacity: .7; }
   .hint { font-size: .8rem; opacity: .7; margin: 6px 0 0; }
   .result-ok { color: #2e7d32; } .result-err { color: #c62828; }
+  .verdict { display: inline-block; padding: 2px 10px; border-radius: 999px;
+             font-weight: 700; font-size: .9rem; }
+  .verdict.consistent { background: #2e7d3233; border: 1px solid #2e7d32; color: #2e7d32; }
+  .verdict.different { background: #c6282833; border: 1px solid #c62828; color: #c62828; }
+  .verdict.insufficient { background: #f9a82533; border: 1px solid #f9a825; color: #8d6e00; }
+  .two-col { display: flex; gap: 12px; flex-wrap: wrap; }
+  .two-col > div { flex: 1 1 300px; }
   form .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
   label { font-size: .85rem; }
   code { background: #8882; padding: 1px 5px; border-radius: 4px; }
@@ -54,7 +61,28 @@
     <button type="submit" name="target" value="A" {% if target == "A" %}disabled{% endif %}>切换到 A</button>
     <button type="submit" name="target" value="B" {% if target == "B" %}disabled{% endif %}>切换到 B</button>
   </form>
-  <p class="hint">切换只影响之后新建的会话；已存在的会话继续走原接收器，直到空闲 {{ idle_timeout }} 秒过期。保存失败时保留原目标。</p>
+  <p class="hint">切换只影响之后新建的会话；已存在的会话继续走原接收器，直到空闲 {{ idle_timeout }} 秒过期。保存失败时保留原目标。切换不会改变正在进行的影子校验所比较的两侧。</p>
+</section>
+
+<section>
+  <h2>影子校验（切流前试跑）</h2>
+  <div class="row">
+    <form method="post" action="{{ url_for('shadow_start') }}">
+      <button type="submit">开启 10 秒影子校验</button>
+    </form>
+    <form method="post" action="{{ url_for('shadow_stop') }}">
+      <button type="submit">结束校验</button>
+    </form>
+  </div>
+  <p class="hint">
+    开启后在 {{ shadow_window }} 秒窗口内发送试传报文建立新会话（不填固定端口）。
+    该会话前 {{ shadow_limit }} 条上行会同时发往固定接收器和另一台接收器，只有固定接收器的回包下发终端。
+    两侧回包按“原文 + 次数”比较（乱序、同文重发不会误判）；缺包、发送失败或超过 {{ shadow_limit }} 条标为证据不足。
+    本次比较的两侧在开启时固定，切换目标不改变它们；校验结束、会话过期或重启后停止镜像，迟到回包不会串入下一次。
+  </p>
+  <div id="shadow-panel" class="card" style="margin-top:10px">
+    <div class="label">尚无影子校验</div>
+  </div>
 </section>
 
 <section>
@@ -86,8 +114,8 @@
 <section>
   <h2>活动会话 <span class="hint">（每 2 秒自动刷新）</span></h2>
   <table>
-    <thead><tr><th>ID</th><th>客户端</th><th>固定接收器</th><th>上游端口</th><th>状态</th><th>空闲(s)</th><th>存活(s)</th></tr></thead>
-    <tbody id="sessions"><tr><td colspan="7">加载中…</td></tr></tbody>
+    <thead><tr><th>ID</th><th>客户端</th><th>固定接收器</th><th>上游端口</th><th>状态</th><th>空闲(s)</th><th>存活(s)</th><th>影子</th></tr></thead>
+    <tbody id="sessions"><tr><td colspan="8">加载中…</td></tr></tbody>
   </table>
 </section>
 
@@ -101,15 +129,44 @@
 
 <script>
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function verdictClass(v) { return v === '一致' ? 'consistent' : v === '差异' ? 'different' : 'insufficient'; }
+function renderShadow(c, labels) {
+  const el = document.getElementById('shadow-panel');
+  if (!c) { el.innerHTML = '<div class="label">尚无影子校验</div>'; return; }
+  const labels_state = { armed: '等待会话', active: '采集中', ended: '已结束' };
+  let stateLabel = labels_state[c.state] || c.state;
+  if (c.state === 'active' && c.detail && c.detail.indexOf('正在收尾') === 0) stateLabel = '收尾中';
+  const rows = (arr) => arr.length
+    ? arr.map(x => `<div><code>${esc(x)}</code></div>`).join('')
+    : '<div class="label">（无回包）</div>';
+  const overflowNote = c.overflow
+    ? `<div class="result-err">多出 ${c.overflow} 条上行未纳入比较（仍按原规则透传）</div>` : '';
+  const errNote = c.send_errors
+    ? `<div class="result-err">镜像发送失败 ${c.send_errors} 次</div>` : '';
+  el.innerHTML =
+    `<div class="label">影子校验 #${c.id} · ${stateLabel} · 已运行 ${c.age}s</div>` +
+    `<div>固定侧 <b>${esc(c.fixed)}</b> ／ 影子侧 <b>${esc(c.shadow)}</b>` +
+    (c.client ? ` · 客户端 <code>${esc(c.client)}</code>` : '') +
+    ` · 已镜像 ${c.sent}/${c.limit} 条</div>` +
+    `<div style="margin:8px 0">结论：<span class="verdict ${verdictClass(labels[c.verdict] || '')}">` +
+    `${esc(labels[c.verdict] || c.verdict)}</span> <span>${esc(c.detail)}</span></div>` +
+    overflowNote + errNote +
+    `<div class="two-col" style="margin-top:8px">` +
+    `<div><div class="label">固定接收器回包 ${c.fixed_count} 条</div>${rows(c.fixed_replies)}</div>` +
+    `<div><div class="label">影子接收器回包 ${c.shadow_count} 条</div>${rows(c.shadow_replies)}</div>` +
+    `</div>`;
+}
 async function refresh() {
   try {
     const s = await (await fetch('/api/state')).json();
     document.getElementById('target').textContent = s.target;
+    renderShadow(s.shadow, s.verdict_labels || {});
     const ss = s.sessions.map(x =>
       `<tr><td>${x.id}</td><td>${esc(x.client)}</td><td><b>${esc(x.receiver)}</b></td>` +
-      `<td>${x.upstream_port ?? ''}</td><td>${esc(x.state)}</td><td>${x.idle}</td><td>${x.age}</td></tr>`);
+      `<td>${x.upstream_port ?? ''}</td><td>${esc(x.state)}</td><td>${x.idle}</td><td>${x.age}</td>` +
+      `<td>${x.shadow ? '是（已镜像 ' + x.shadow_sent + '）' : ''}</td></tr>`);
     document.getElementById('sessions').innerHTML =
-      ss.join('') || '<tr><td colspan="7">（无活动会话）</td></tr>';
+      ss.join('') || '<tr><td colspan="8">（无活动会话）</td></tr>';
     const ms = s.messages.map(m =>
       `<tr><td>${m.id}</td><td>${esc(m.ts)}</td><td>${esc(m.client)}</td><td>${m.session_id || ''}</td>` +
       `<td>${esc(m.direction)}</td><td>${esc(m.receiver)}</td><td>${esc(m.payload)}</td><td>${esc(m.note)}</td></tr>`);

@@ -15,6 +15,8 @@ services:
       RECEIVER_NAME: B
       LISTEN_PORT: "9001"
       REPLY_DELAY: "0"
+      # 演示“差异”时可让本地接收器返回不同内容，例如：
+      # REPLY_TEMPLATE: "B:{payload}"
     networks: [telemetry]
 
   proxy:
@@ -30,6 +32,10 @@ services:
       RECEIVER_B_PORT: "9001"
       DB_PATH: /data/proxy.db            # 目标接收器持久化（重启保留）
       # UPSTREAM_PORT_COOLDOWN: "30"     # 上游端口冷却，须大于最大回包延迟
+      SHADOW_WINDOW: "10"                # 影子校验：开启后绑定新会话的窗口（秒）
+      SHADOW_LIMIT: "16"                 # 影子校验：每会话最多比较多少条上行
+      # SHADOW_DRAIN: "1"                # 手动结束后的收尾时间（秒）
+      # SHADOW_MAX_DURATION: "75"        # 单次校验总时长上限（秒）
     ports:
       - "9000:9000/udp"                  # 遥测终端发往这里
       - "8080:8080"                      # 操作网页
