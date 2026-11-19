@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>遥测 UDP 代理控制台</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0 auto; max-width: 1080px; padding: 16px; line-height: 1.5; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-bottom: 8px; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+  .card { border: 1px solid #8885; border-radius: 8px; padding: 10px 16px; min-width: 150px; }
+  .card .label { font-size: .8rem; opacity: .7; }
+  .card .big { font-size: 1.8rem; font-weight: 700; }
+  section { border: 1px solid #8885; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+  button { padding: 6px 14px; border-radius: 6px; border: 1px solid #8888; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  input { padding: 5px 8px; border-radius: 6px; border: 1px solid #8888; }
+  .flash { padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
+  .flash.ok { background: #2e7d3233; border: 1px solid #2e7d32; }
+  .flash.error { background: #c6282833; border: 1px solid #c62828; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { border-bottom: 1px solid #8884; padding: 4px 8px; text-align: left;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+  th { opacity: .7; }
+  .hint { font-size: .8rem; opacity: .7; margin: 6px 0 0; }
+  .result-ok { color: #2e7d32; } .result-err { color: #c62828; }
+  form .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  label { font-size: .85rem; }
+  code { background: #8882; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>遥测 UDP 代理控制台</h1>
+
+<div class="cards">
+  <div class="card"><div class="label">当前目标接收器（新会话）</div>
+    <div class="big" id="target">{{ target }}</div></div>
+  <div class="card"><div class="label">接收器 A</div><div class="big" style="font-size:1rem">{{ receivers["A"] }}</div></div>
+  <div class="card"><div class="label">接收器 B</div><div class="big" style="font-size:1rem">{{ receivers["B"] }}</div></div>
+  <div class="card"><div class="label">会话空闲超时</div><div class="big" style="font-size:1rem">{{ idle_timeout }} s</div></div>
+  <div class="card"><div class="label">终端发送地址（UDP）</div><div class="big" style="font-size:1rem">本机 :{{ udp_listen_port }}</div></div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
+{% endwith %}
+
+<section>
+  <h2>切换目标接收器</h2>
+  <form method="post" action="{{ url_for('switch') }}">
+    <button type="submit" name="target" value="A" {% if target == "A" %}disabled{% endif %}>切换到 A</button>
+    <button type="submit" name="target" value="B" {% if target == "B" %}disabled{% endif %}>切换到 B</button>
+  </form>
+  <p class="hint">切换只影响之后新建的会话；已存在的会话继续走原接收器，直到空闲 {{ idle_timeout }} 秒过期。保存失败时保留原目标。</p>
+</section>
+
+<section>
+  <h2>发送试传报文</h2>
+  <form method="post" action="{{ url_for('test') }}">
+    <div class="row">
+      <label>报文 <input name="payload" value="PING" size="24"></label>
+      <label>回包延迟(秒) <input name="delay" type="number" min="0" step="0.5" value="0" style="width:70px"></label>
+      <label>等待超时(秒) <input name="wait" type="number" min="1" max="60" value="10" style="width:70px"></label>
+      <label>固定客户端端口 <input name="client_port" type="number" min="1" max="65535" placeholder="留空=随机" style="width:110px"></label>
+      <button type="submit">发送</button>
+    </div>
+    <p class="hint">不填端口时每次试传都用新端口（总是新会话）。填同一端口可观察：空闲 {{ idle_timeout }} 秒内复用旧会话（仍走旧接收器）；超时后同端口重建会话，也收不到旧会话迟到的回包。</p>
+  </form>
+  {% if last_test %}
+  <div class="card" style="margin-top:10px">
+    <div class="label">最近一次试传（{{ last_test.time }}）</div>
+    <div>客户端 <code>{{ last_test.client }}</code> → 实际去向接收器
+      <b>{{ last_test.receiver or "?" }}</b>，报文 <code>{{ last_test.payload }}</code></div>
+    {% if last_test.ok %}
+      <div class="result-ok">收到回包：<code>{{ last_test.reply }}</code>（RTT {{ last_test.rtt }}s）</div>
+    {% else %}
+      <div class="result-err">{{ last_test.error }}</div>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+
+<section>
+  <h2>活动会话 <span class="hint">（每 2 秒自动刷新）</span></h2>
+  <table>
+    <thead><tr><th>ID</th><th>客户端</th><th>固定接收器</th><th>上游端口</th><th>状态</th><th>空闲(s)</th><th>存活(s)</th></tr></thead>
+    <tbody id="sessions"><tr><td colspan="7">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>报文日志（实际去向与回包） <span class="hint">（最近 100 条，每 2 秒自动刷新）</span></h2>
+  <table>
+    <thead><tr><th>#</th><th>时间</th><th>客户端</th><th>会话</th><th>方向</th><th>接收器</th><th>报文内容</th><th>备注</th></tr></thead>
+    <tbody id="messages"><tr><td colspan="8">加载中…</td></tr></tbody>
+  </table>
+</section>
+
+<script>
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/state')).json();
+    document.getElementById('target').textContent = s.target;
+    const ss = s.sessions.map(x =>
+      `<tr><td>${x.id}</td><td>${esc(x.client)}</td><td><b>${esc(x.receiver)}</b></td>` +
+      `<td>${x.upstream_port ?? ''}</td><td>${esc(x.state)}</td><td>${x.idle}</td><td>${x.age}</td></tr>`);
+    document.getElementById('sessions').innerHTML =
+      ss.join('') || '<tr><td colspan="7">（无活动会话）</td></tr>';
+    const ms = s.messages.map(m =>
+      `<tr><td>${m.id}</td><td>${esc(m.ts)}</td><td>${esc(m.client)}</td><td>${m.session_id || ''}</td>` +
+      `<td>${esc(m.direction)}</td><td>${esc(m.receiver)}</td><td>${esc(m.payload)}</td><td>${esc(m.note)}</td></tr>`);
+    document.getElementById('messages').innerHTML =
+      ms.join('') || '<tr><td colspan="8">（暂无日志）</td></tr>';
+  } catch (e) { /* 下次再试 */ }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
